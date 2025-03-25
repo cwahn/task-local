@@ -2,6 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/task-local.svg)](https://crates.io/crates/task-local)
 [![Documentation](https://docs.rs/task-local/badge.svg)](https://docs.rs/task-local)
+[![CI Status](https://github.com/BugenZhao/task-local/workflows/CI/badge.svg)](https://github.com/BugenZhao/task-local/actions)
 [![License: MIT OR Apache-2.0](https://img.shields.io/crates/l/task-local.svg)](LICENSE)
 
 Task-local storage for asynchronous tasks, extracted from the `tokio::task_local` module.
