@@ -10,6 +10,11 @@ readme = "README.md"
 keywords = ["async", "task", "local", "storage"]
 categories = ["asynchronous", "concurrency"]
 
+[features]
+default = ["std"]
+std = []
+error-trait = ["std"]
+
 [dependencies]
 pin-project-lite = "0.2.9"
 

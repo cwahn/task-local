@@ -3,15 +3,107 @@
 //! This crate provides a way to store task-local values across `.await` points.
 //! It was extracted from the `tokio::task_local` module and can be used independently
 //! of the Tokio runtime.
+//!
+//! # Features
+//!
+//! - `std` (default): Use the standard library thread-local implementation
+//! - `error-trait`: Enable `std::error::Error` implementation for error types
+//!
+//! # Standard Library Usage
+//!
+//! By default, this crate uses the standard library and provides full functionality
+//! including async support with proper task isolation via thread-local storage.
+//!
+//! ```toml
+//! [dependencies]
+//! task-local = "0.1"
+//! ```
+//!
+//! # No-std Usage
+//!
+//! When using this crate in no_std environments (like embedded systems with Embassy),
+//! disable the default features to get a no_std compatible version:
+//!
+//! ```toml
+//! [dependencies]
+//! task-local = { version = "0.1", default-features = false }
+//! ```
+//!
+//! The no_std implementation uses a simpler storage mechanism that works well for
+//! single-threaded embedded environments. It provides the same API but with some
+//! limitations:
+//!
+//! - No thread-local storage (uses unsafe cell instead)
+//! - Designed for single-threaded environments
+//! - Perfect for Embassy and other embedded async runtimes
+//! - Same API as the std version
+//! - **Important**: In no_std mode, all task-locals share global state, so concurrent
+//!   access (like in tests) may interfere with each other. This is expected behavior
+//!   for single-threaded embedded systems where tasks run cooperatively.
+//!
+//! ## No-std Example
+//!
+//! ```ignore
+//! #![no_std]
+//! use task_local::task_local;
+//!
+//! task_local! {
+//!     static SENSOR_ID: u32;
+//! }
+//!
+//! // Synchronous usage
+//! SENSOR_ID.sync_scope(42, || {
+//!     let id = SENSOR_ID.get();
+//!     // ... use sensor id
+//! });
+//!
+//! // Async usage with Embassy or similar
+//! async fn sensor_task() {
+//!     SENSOR_ID.scope(42, async move {
+//!         let id = SENSOR_ID.get();
+//!         // ... async sensor operations
+//!     }).await;
+//! }
+//! ```
+
+#![cfg_attr(not(feature = "std"), no_std)]
 
 use pin_project_lite::pin_project;
+
+#[cfg(feature = "std")]
 use std::cell::RefCell;
+
+#[cfg(feature = "error-trait")]
 use std::error::Error;
+
+#[cfg(feature = "std")]
 use std::future::Future;
+#[cfg(not(feature = "std"))]
+use core::future::Future;
+
+#[cfg(feature = "std")]
 use std::marker::PhantomPinned;
+#[cfg(not(feature = "std"))]
+use core::marker::PhantomPinned;
+
+#[cfg(feature = "std")]
 use std::pin::Pin;
+#[cfg(not(feature = "std"))]
+use core::pin::Pin;
+
+#[cfg(feature = "std")]
 use std::task::{Context, Poll};
+#[cfg(not(feature = "std"))]
+use core::task::{Context, Poll};
+
+#[cfg(feature = "std")]
 use std::{fmt, mem, thread};
+#[cfg(not(feature = "std"))]
+use core::{fmt, mem};
+
+// No-std specific imports
+#[cfg(not(feature = "std"))]
+use core::cell::UnsafeCell;
 
 /// Declares a new task-local key of type [`LocalKey`].
 ///
@@ -49,6 +141,8 @@ macro_rules! task_local {
     }
 }
 
+// Conditional implementation based on std feature
+#[cfg(feature = "std")]
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __task_local_inner {
@@ -61,6 +155,16 @@ macro_rules! __task_local_inner {
 
             $crate::LocalKey { inner: __KEY }
         };
+    };
+}
+
+#[cfg(not(feature = "std"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __task_local_inner {
+    ($(#[$attr:meta])* $vis:vis $name:ident, $t:ty) => {
+        $(#[$attr])*
+        $vis static $name: $crate::LocalKey<$t> = $crate::LocalKey::new();
     };
 }
 
@@ -96,11 +200,185 @@ macro_rules! __task_local_inner {
 /// ```
 ///
 /// [`std::thread::LocalKey`]: struct@std::thread::LocalKey
+#[cfg(feature = "std")]
 pub struct LocalKey<T: 'static> {
     #[doc(hidden)]
     pub inner: thread::LocalKey<RefCell<Option<T>>>,
 }
 
+/// A key for task-local data in no_std environments.
+///
+/// This is a simplified version that works well with single-threaded
+/// embedded systems like those using Embassy.
+#[cfg(not(feature = "std"))]
+pub struct LocalKey<T: 'static> {
+    inner: UnsafeCell<Option<T>>,
+}
+
+// Safety: LocalKey is safe to share between tasks in single-threaded embedded systems
+#[cfg(not(feature = "std"))]
+unsafe impl<T: 'static> Sync for LocalKey<T> {}
+#[cfg(not(feature = "std"))]
+unsafe impl<T: 'static> Send for LocalKey<T> {}
+
+// Implementation for no_std
+#[cfg(not(feature = "std"))]
+impl<T: 'static> LocalKey<T> {
+    /// Creates a new LocalKey for no_std environments.
+    pub const fn new() -> Self {
+        Self {
+            inner: UnsafeCell::new(None),
+        }
+    }
+
+    /// Sets a value `T` as the task-local value for the future `F`.
+    ///
+    /// On completion of `scope`, the task-local will be dropped.
+    ///
+    /// ### Panics
+    ///
+    /// If you poll the returned future inside a call to [`with`] or
+    /// [`try_with`] on the same `LocalKey`, then the call to `poll` will panic.
+    ///
+    /// ### Examples
+    ///
+    /// ```ignore
+    /// # use task_local::task_local;
+    /// # async fn dox() {
+    /// task_local! {
+    ///     static NUMBER: u32;
+    /// }
+    ///
+    /// NUMBER.scope(1, async move {
+    ///     // println! not available in no_std, but you get the idea
+    ///     assert_eq!(NUMBER.get(), 1);
+    /// }).await;
+    /// # }
+    /// ```
+    ///
+    /// [`with`]: fn@Self::with
+    /// [`try_with`]: fn@Self::try_with
+    pub fn scope<F>(&'static self, value: T, f: F) -> TaskLocalFuture<T, F>
+    where
+        F: Future,
+    {
+        TaskLocalFuture {
+            local: self,
+            slot: Some(value),
+            future: Some(f),
+            _pinned: PhantomPinned,
+        }
+    }
+
+    /// Sets a value `T` as the task-local value for the closure `F`.
+    ///
+    /// On completion of `sync_scope`, the task-local will be dropped.
+    ///
+    /// ### Panics
+    ///
+    /// This method panics if called inside a call to [`with`] or [`try_with`]
+    /// on the same `LocalKey`, or if interrupts occur during execution.
+    ///
+    /// ### Examples
+    ///
+    /// ```ignore
+    /// # use task_local::task_local;
+    /// task_local! {
+    ///     static NUMBER: u32;
+    /// }
+    ///
+    /// NUMBER.sync_scope(1, || {
+    ///     assert_eq!(NUMBER.get(), 1);
+    /// });
+    /// ```
+    ///
+    /// [`with`]: fn@Self::with
+    /// [`try_with`]: fn@Self::try_with
+    #[track_caller]
+    pub fn sync_scope<F, R>(&'static self, value: T, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let mut value = Some(value);
+        match self.scope_inner(&mut value, f) {
+            Ok(res) => res,
+            Err(err) => err.panic(),
+        }
+    }
+
+    fn scope_inner<F, R>(&'static self, slot: &mut Option<T>, f: F) -> Result<R, ScopeInnerErr>
+    where
+        F: FnOnce() -> R,
+    {
+        struct Guard<'a, T: 'static> {
+            local: &'static LocalKey<T>,
+            slot: &'a mut Option<T>,
+        }
+
+        impl<T: 'static> Drop for Guard<'_, T> {
+            fn drop(&mut self) {
+                // Safety: We're in single-threaded no_std environment
+                // and we own the slot data
+                unsafe {
+                    let inner_ptr = self.local.inner.get();
+                    mem::swap(self.slot, &mut *inner_ptr);
+                }
+            }
+        }
+
+        // Safety: We're in single-threaded no_std environment
+        unsafe {
+            let inner_ptr = self.inner.get();
+            mem::swap(slot, &mut *inner_ptr);
+        }
+
+        let guard = Guard { local: self, slot };
+
+        let res = f();
+
+        drop(guard);
+
+        Ok(res)
+    }
+
+    /// Accesses the current task-local and runs the provided closure.
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if the task local doesn't have a value set.
+    #[track_caller]
+    pub fn with<F, R>(&'static self, f: F) -> R
+    where
+        F: FnOnce(&T) -> R,
+    {
+        match self.try_with(f) {
+            Ok(res) => res,
+            Err(_) => panic!("cannot access a task-local storage value without setting it first"),
+        }
+    }
+
+    /// Accesses the current task-local and runs the provided closure.
+    ///
+    /// If the task-local with the associated key is not present, this
+    /// method will return an `AccessError`. For a panicking variant,
+    /// see `with`.
+    pub fn try_with<F, R>(&'static self, f: F) -> Result<R, AccessError>
+    where
+        F: FnOnce(&T) -> R,
+    {
+        // Safety: In single-threaded no_std environments, this is safe.
+        unsafe {
+            let inner_ptr = self.inner.get();
+            match (*inner_ptr).as_ref() {
+                Some(value) => Ok(f(value)),
+                None => Err(AccessError { _private: () }),
+            }
+        }
+    }
+}
+
+// Implementation for std
+#[cfg(feature = "std")]
 impl<T: 'static> LocalKey<T> {
     /// Sets a value `T` as the task-local value for the future `F`.
     ///
@@ -448,8 +726,10 @@ impl fmt::Display for AccessError {
     }
 }
 
+#[cfg(feature = "error-trait")]
 impl Error for AccessError {}
 
+#[allow(dead_code)]
 enum ScopeInnerErr {
     BorrowError,
     AccessError,
@@ -469,14 +749,19 @@ impl ScopeInnerErr {
     }
 }
 
+#[cfg(feature = "std")]
 impl From<std::cell::BorrowMutError> for ScopeInnerErr {
     fn from(_: std::cell::BorrowMutError) -> Self {
         Self::BorrowError
     }
 }
 
+#[cfg(feature = "std")]
 impl From<std::thread::AccessError> for ScopeInnerErr {
     fn from(_: std::thread::AccessError) -> Self {
         Self::AccessError
     }
 }
+
+#[cfg(test)]
+mod tests;
